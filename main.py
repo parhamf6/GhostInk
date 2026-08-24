@@ -30,7 +30,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QEvent, QRectF, QThread, Signal
+from PySide6.QtCore import Qt, QTimer, QEvent, QRectF, QThread, Signal, QSettings, QUrl
 from PySide6.QtGui import (
     QImage, QPainter, QPen, QColor, QTabletEvent, QPixmap,
     QShortcut, QKeySequence,
@@ -39,8 +39,14 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QSlider,
     QColorDialog, QComboBox, QFileDialog, QMessageBox, QStatusBar,
     QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea, QButtonGroup,
-    QGraphicsDropShadowEffect, QSizePolicy, QProgressBar,
+    QGraphicsDropShadowEffect, QSizePolicy, QProgressBar, QCheckBox,
 )
+
+try:
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
+    MEDIA_OK = True
+except Exception:
+    MEDIA_OK = False
 
 # ---------------------------------------------------------------------------
 # Tweak these if you want a different canvas / video size or frame rate.
@@ -67,6 +73,11 @@ PALETTE = [
     "#ffffff", "#141414", "#8e8e9a", "#ff4d5e", "#ff9f0a", "#ffd60a",
     "#30d158", "#64d2ff", "#4cc9f0", "#5e5ce6", "#bf5af2", "#ff375f",
 ]
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff"}
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".flv"}
+MEDIA_FILTER = "Media (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff " \
+               "*.mp4 *.mkv *.mov *.webm *.avi *.m4v *.ts *.flv)"
 
 STYLESHEET = """
 * { outline: none; }
@@ -202,6 +213,24 @@ QProgressBar {
     font-size: 10px;
 }
 QProgressBar::chunk { background: %(accent)s; }
+
+QCheckBox {
+    spacing: 9px;
+    background: transparent;
+    color: %(text)s;
+    font-weight: 600;
+}
+QCheckBox::indicator {
+    width: 15px;
+    height: 15px;
+    border: 1px solid %(borderHi)s;
+    background: %(panel2)s;
+}
+QCheckBox::indicator:hover { border-color: %(accent)s; }
+QCheckBox::indicator:checked {
+    background: %(accent)s;
+    border-color: %(accent)s;
+}
 """
 
 REC_QSS_IDLE = """
@@ -283,6 +312,9 @@ class Canvas(QWidget):
 
         self.pen_color = QColor(255, 255, 255, 255)
         self.base_width = 4.0
+
+        self.bg_image = None
+        self.bg_opacity = 1.0
 
         self._drawing = False
         self._last_point = None
@@ -368,6 +400,11 @@ class Canvas(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.drawPixmap(0, 0, self._checker)
+        bg = self.bg_image
+        if bg is not None and not bg.isNull():
+            p.setOpacity(max(0.0, min(1.0, self.bg_opacity)))
+            p.drawImage(0, 0, bg)
+            p.setOpacity(1.0)
         p.drawImage(0, 0, self.image)
         p.setPen(QPen(QColor("#363642"), 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -393,13 +430,13 @@ class Canvas(QWidget):
 class Recorder:
     FORMATS = {
         "webm": {
-            "label": "WebM · VP9 alpha (OBS)",
+            "label": "WebM · VP9 alpha",
             "ext": "webm",
             "args": ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
                       "-b:v", "0", "-crf", "28", "-row-mt", "1"],
         },
         "mov": {
-            "label": "MOV · lossless  (video editors)",
+            "label": "MOV · lossless",
             "ext": "mov",
             "args": ["-c:v", "qtrle"],
         },
@@ -555,8 +592,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GhostInk")
-        self.setMinimumSize(1120, 780)
-        self.resize(1520, 940)
+        self.setMinimumSize(1120, 880)
+        self.resize(1520, 980)
 
         self.canvas = Canvas(CANVAS_WIDTH, CANVAS_HEIGHT)
         self.recorder = Recorder(CANVAS_WIDTH, CANVAS_HEIGHT, FPS)
@@ -564,8 +601,30 @@ class MainWindow(QMainWindow):
         self.record_start_time = None
         self._pulse_on = True
 
+        self.settings = QSettings("GhostInk", "GhostInk")
+        self.bg_is_video = False
+        self._scrubbing = False
+        self._frame_parity = 0
+        self._primed_src = None
+
+        self.player = None
+        if MEDIA_OK:
+            self.audio_out = QAudioOutput()
+            self.audio_out.setVolume(1.0)
+            self.player = QMediaPlayer()
+            self.player.setAudioOutput(self.audio_out)
+            self.video_sink = QVideoSink()
+            self.player.setVideoSink(self.video_sink)
+            self.video_sink.videoFrameChanged.connect(self._on_video_frame)
+            self.player.positionChanged.connect(self._on_position)
+            self.player.durationChanged.connect(self._on_duration)
+            self.player.mediaStatusChanged.connect(self._on_media_status)
+            self.player.playbackStateChanged.connect(self._on_play_state)
+            self.player.errorOccurred.connect(self._on_media_error)
+
         self._build_ui()
         self._build_shortcuts()
+        self._restore_settings()
 
         self.frame_timer = QTimer(self)
         self.frame_timer.setInterval(int(1000 / FPS))
@@ -588,12 +647,18 @@ class MainWindow(QMainWindow):
         host_layout = QVBoxLayout(host)
         host_layout.setContentsMargins(44, 36, 44, 36)
 
+        stage = QWidget()
+        stage_layout = QVBoxLayout(stage)
+        stage_layout.setContentsMargins(0, 0, 0, 0)
+        stage_layout.setSpacing(14)
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(60)
         shadow.setOffset(0, 12)
         shadow.setColor(QColor(0, 0, 0, 170))
         self.canvas.setGraphicsEffect(shadow)
-        host_layout.addWidget(self.canvas, alignment=Qt.AlignmentFlag.AlignCenter)
+        stage_layout.addWidget(self.canvas, 0, Qt.AlignmentFlag.AlignHCenter)
+        stage_layout.addWidget(self._build_transport())
+        host_layout.addWidget(stage, 0, Qt.AlignmentFlag.AlignCenter)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -610,6 +675,49 @@ class MainWindow(QMainWindow):
         status.showMessage("Ready — draw with the tablet pen, only the canvas gets recorded.")
         perm = QLabel(f"{CANVAS_WIDTH} × {CANVAS_HEIGHT} · {FPS} fps", objectName="statusPerm")
         status.addPermanentWidget(perm)
+
+    def _build_transport(self):
+        bar = QWidget()
+        bar.setFixedHeight(42)
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(12)
+
+        self.play_btn = QPushButton("Play")
+        self.play_btn.setFixedWidth(84)
+        self.play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.play_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.play_btn.setToolTip("Play / pause background (Space)")
+        self.play_btn.clicked.connect(self._toggle_play)
+        h.addWidget(self.play_btn)
+
+        self.time_cur = QLabel("00:00", objectName="sizeVal")
+        self.time_cur.setMinimumWidth(42)
+        h.addWidget(self.time_cur)
+
+        self.scrub = QSlider(Qt.Orientation.Horizontal)
+        self.scrub.setRange(0, 0)
+        self.scrub.sliderPressed.connect(self._on_scrub_pressed)
+        self.scrub.sliderReleased.connect(self._on_scrub_released)
+        self.scrub.sliderMoved.connect(self._on_scrub_moved)
+        h.addWidget(self.scrub, 1)
+
+        self.time_dur = QLabel("00:00", objectName="sizeVal")
+        self.time_dur.setMinimumWidth(42)
+        h.addWidget(self.time_dur)
+
+        self.mute_btn = QPushButton("Mute")
+        self.mute_btn.setCheckable(True)
+        self.mute_btn.setFixedWidth(84)
+        self.mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mute_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mute_btn.setToolTip("Mute / unmute background audio")
+        self.mute_btn.toggled.connect(self._toggle_mute)
+        h.addWidget(self.mute_btn)
+
+        self.transport = bar
+        bar.setVisible(False)
+        return bar
 
     def _section_label(self, text):
         lbl = QLabel(text)
@@ -708,6 +816,43 @@ class MainWindow(QMainWindow):
         col.addLayout(actions)
 
         col.addWidget(self._rule())
+        col.addWidget(self._section_label("BACKGROUND"))
+
+        bg_actions = QHBoxLayout()
+        bg_actions.setSpacing(9)
+        self.load_bg_btn = QPushButton("Load…")
+        self.load_bg_btn.setStatusTip("Load an image or video as preview background")
+        self.load_bg_btn.clicked.connect(self._load_background)
+        self.clear_bg_btn = QPushButton("Remove")
+        self.clear_bg_btn.setStatusTip("Remove the background preview")
+        self.clear_bg_btn.clicked.connect(self._clear_background)
+        self.clear_bg_btn.setEnabled(False)
+        bg_actions.addWidget(self.load_bg_btn, 1)
+        bg_actions.addWidget(self.clear_bg_btn, 1)
+        col.addLayout(bg_actions)
+
+        self.bg_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.bg_opacity_slider.setRange(10, 100)
+        self.bg_opacity_slider.setValue(100)
+        self.bg_opacity_slider.setToolTip("Background opacity")
+        self.bg_opacity_slider.valueChanged.connect(self._set_bg_opacity)
+        col.addWidget(self.bg_opacity_slider)
+
+        self.play_on_record_cb = QCheckBox("Play when recording starts")
+        self.play_on_record_cb.setChecked(True)
+        self.play_on_record_cb.toggled.connect(self._bg_setting_changed)
+        col.addWidget(self.play_on_record_cb)
+
+        self.light_preview_cb = QCheckBox("Light preview while recording")
+        self.light_preview_cb.toggled.connect(self._bg_setting_changed)
+        col.addWidget(self.light_preview_cb)
+
+        self.loop_cb = QCheckBox("Loop background")
+        self.loop_cb.setChecked(True)
+        self.loop_cb.toggled.connect(self._toggle_loop)
+        col.addWidget(self.loop_cb)
+
+        col.addWidget(self._rule())
         col.addWidget(self._section_label("OUTPUT"))
 
         self.format_combo = QComboBox()
@@ -717,8 +862,8 @@ class MainWindow(QMainWindow):
 
         col.addWidget(QLabel("Render", objectName="hintLbl"))
         self.render_mode_combo = QComboBox()
-        self.render_mode_combo.addItem("Live · encode while recording", "live")
-        self.render_mode_combo.addItem("After stop · encode on finish", "deferred")
+        self.render_mode_combo.addItem("Live · encode now", "live")
+        self.render_mode_combo.addItem("After stop", "deferred")
         col.addWidget(self.render_mode_combo)
 
         col.addStretch(1)
@@ -776,6 +921,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+N"), self, activated=self._clear_canvas)
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self._toggle_recording)
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self._escape)
+        QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self._toggle_play)
 
     def _repolish(self, widget):
         widget.style().unpolish(widget)
@@ -817,6 +963,178 @@ class MainWindow(QMainWindow):
         if self.recording:
             self._stop_recording()
 
+    # -- background preview ---------------------------------------------------
+    def _load_background(self):
+        videos_dir = Path.home() / "Videos"
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load background", str(videos_dir), MEDIA_FILTER
+        )
+        if not path:
+            return
+        self._apply_background(path)
+
+    def _apply_background(self, path):
+        ext = Path(path).suffix.lower()
+        if ext in VIDEO_EXTS:
+            if not MEDIA_OK:
+                QMessageBox.warning(
+                    self, "Background",
+                    "Video preview needs Qt Multimedia, which is not available"
+                    " in this environment. Images still work.")
+                return
+            try:
+                self.bg_is_video = True
+                self.player.setSource(QUrl.fromLocalFile(path))
+                self.transport.setVisible(True)
+            except Exception as e:
+                self.bg_is_video = False
+                self.transport.setVisible(False)
+                QMessageBox.warning(self, "Background",
+                                    f"Could not open this video: {e}")
+                return
+        elif ext in IMAGE_EXTS:
+            self.bg_is_video = False
+            if self.player:
+                self.player.setSource(QUrl())
+                self.player.pause()
+            pm = QPixmap(path)
+            if pm.isNull():
+                QMessageBox.warning(self, "Background", "Could not load image.")
+                return
+            scaled = pm.scaled(
+                CANVAS_WIDTH, CANVAS_HEIGHT,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            self.canvas.bg_image = scaled.toImage()
+            self.canvas.update()
+            self.transport.setVisible(False)
+        else:
+            QMessageBox.warning(self, "Background", "Unsupported file type.")
+            return
+
+        self.bg_path = path
+        self.clear_bg_btn.setEnabled(True)
+        self.settings.setValue("bg_path", path)
+
+    def _clear_background(self):
+        self.bg_path = None
+        self.bg_is_video = False
+        if self.player:
+            self.player.pause()
+            self.player.setSource(QUrl())
+        self.canvas.bg_image = None
+        self.canvas.update()
+        self.transport.setVisible(False)
+        self.clear_bg_btn.setEnabled(False)
+        self.settings.remove("bg_path")
+
+    def _set_bg_opacity(self, value):
+        self.canvas.bg_opacity = value / 100.0
+        self.settings.setValue("bg_opacity", value)
+        self.canvas.update()
+
+    def _bg_setting_changed(self):
+        self.settings.setValue("play_on_record", self.play_on_record_cb.isChecked())
+        self.settings.setValue("light_preview", self.light_preview_cb.isChecked())
+
+    def _toggle_loop(self, checked):
+        self.settings.setValue("loop", checked)
+
+    def _toggle_play(self):
+        if not (self.player and self.bg_is_video):
+            return
+        state = self.player.playbackState()
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+            return
+        dur = self.player.duration()
+        if dur > 0 and self.player.position() >= dur - 100:
+            self.player.setPosition(0)
+        self.player.play()
+
+    def _toggle_mute(self, checked):
+        self.mute_btn.setText("Muted" if checked else "Mute")
+        if self.audio_out:
+            self.audio_out.setMuted(checked)
+        self.settings.setValue("mute", checked)
+
+    def _on_video_frame(self, frame):
+        if not frame.isValid():
+            return
+        if self.recording and self.light_preview_cb.isChecked():
+            self._frame_parity ^= 1
+            if self._frame_parity:
+                return
+        img = frame.toImage()
+        if img.size() != self.canvas.size():
+            img = img.scaled(
+                CANVAS_WIDTH, CANVAS_HEIGHT,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.FastTransformation)
+        self.canvas.bg_image = img
+        self.canvas.update()
+
+    def _on_scrub_pressed(self):
+        self._scrubbing = True
+
+    def _on_scrub_released(self):
+        self._scrubbing = False
+        if self.player:
+            self.player.setPosition(self.scrub.value())
+
+    def _on_scrub_moved(self, value):
+        if self.player:
+            self.player.setPosition(value)
+        self.time_cur.setText(_fmt_time(value / 1000))
+
+    def _on_position(self, ms):
+        if not self._scrubbing:
+            self.scrub.setValue(ms)
+        self.time_cur.setText(_fmt_time(ms / 1000))
+
+    def _on_duration(self, ms):
+        self.scrub.setRange(0, max(ms, 0))
+        self.time_dur.setText(_fmt_time(ms / 1000))
+
+    def _on_play_state(self, state):
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self.play_btn.setText("Pause" if playing else "Play")
+
+    def _on_media_status(self, status):
+        if status == QMediaPlayer.MediaStatus.LoadedMedia:
+            if self._primed_src != self.bg_path:
+                self._primed_src = self.bg_path
+                self.player.pause()
+                self.player.setPosition(0)
+        elif status == QMediaPlayer.MediaStatus.EndOfMedia:
+            if self.bg_is_video and self.loop_cb.isChecked():
+                self.player.setPosition(0)
+                self.player.play()
+
+    def _on_media_error(self, error, error_string):
+        if self.bg_is_video:
+            QMessageBox.warning(self, "Background",
+                                f"Could not play this video: {error_string}")
+            self._clear_background()
+
+    def _restore_settings(self):
+        self.play_on_record_cb.setChecked(
+            self.settings.value("play_on_record", "true") in ("true", True))
+        self.light_preview_cb.setChecked(
+            self.settings.value("light_preview", "false") in ("true", True))
+        self.loop_cb.setChecked(self.settings.value("loop", "true") in ("true", True))
+        mute = self.settings.value("mute", "false") in ("true", True)
+        self.mute_btn.setChecked(mute)
+        self.mute_btn.setText("Muted" if mute else "Mute")
+        if self.audio_out:
+            self.audio_out.setMuted(mute)
+        opacity = int(self.settings.value("bg_opacity", 100))
+        self.bg_opacity_slider.setValue(max(10, min(100, opacity)))
+        self.canvas.bg_opacity = self.bg_opacity_slider.value() / 100.0
+        saved = self.settings.value("bg_path", "")
+        if saved and Path(saved).exists():
+            self._apply_background(saved)
+
     # -- recording -----------------------------------------------------------
     def _toggle_recording(self):
         if not self.recording:
@@ -857,10 +1175,19 @@ class MainWindow(QMainWindow):
         self.ui_timer.start()
         self.status.showMessage(f"Recording to {path} …")
 
+        if (self.bg_is_video and self.player
+                and self.play_on_record_cb.isChecked()):
+            dur = self.player.duration()
+            if dur > 0 and self.player.position() >= dur - 100:
+                self.player.setPosition(0)
+            self.player.play()
+
     def _stop_recording(self):
         self.frame_timer.stop()
         self.ui_timer.stop()
         self.recording = False
+        if self.player:
+            self.player.pause()
         self.record_btn.setText("●  Record")
         self.record_btn.setStyleSheet(REC_QSS_IDLE)
         self.rec_chip.hide()
@@ -932,6 +1259,8 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event):
+        if self.player:
+            self.player.stop()
         for w in (getattr(self, "_encode_worker", None),
                   getattr(self, "_finalize_worker", None)):
             if w is not None and w.isRunning():
@@ -945,6 +1274,8 @@ class MainWindow(QMainWindow):
         self.frame_timer.stop()
         self.ui_timer.stop()
         self.recording = False
+        if self.player:
+            self.player.pause()
         self.record_btn.setText("●  Record")
         self.record_btn.setStyleSheet(REC_QSS_IDLE)
         self.rec_chip.hide()

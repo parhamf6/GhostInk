@@ -14,6 +14,11 @@
 
 - **Real alpha output** — WebM (VP9 + alpha) or MOV (QuickTime Animation,
   lossless). Compositing-ready for OBS, DaVinci Resolve, Premiere, Shotcut.
+- **Background preview** — load an image or video behind the transparent
+  canvas to see how your ink reads over the real content while you draw.
+  Video plays with audio, has a scrub/timeline bar, and can auto-play from
+  your chosen position when recording starts. The background is preview-only
+  and is **never** recorded.
 - **Two render modes**
   - **Live** — encodes with ffmpeg *while* you draw; the file is ready the
     moment you hit stop.
@@ -68,6 +73,7 @@ The checkerboard behind the canvas is preview-only; it is never recorded.
 | `Ctrl+Z` | Undo last stroke |
 | `Ctrl+N` | Clear canvas |
 | `Ctrl+R` | Start / stop recording |
+| `Space` | Play / pause background video |
 | `Esc` | Stop recording |
 
 ## Tablet notes (Huion H430P and friends)
